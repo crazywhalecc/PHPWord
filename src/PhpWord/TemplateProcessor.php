@@ -334,6 +334,10 @@ class TemplateProcessor
             }
             unset($item);
         } else {
+            // int is buggy here
+            if (!is_string($replace)) {
+                $replace = strval($replace);
+            }
             $replace = static::ensureUtf8Encoded($replace);
         }
 
