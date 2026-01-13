@@ -706,11 +706,6 @@ class TemplateProcessor
             $elements = $element->getElements();
             foreach ($elements as $childElement) {
                 if ($childElement instanceof Element\Image) {
-                    // CRITICAL FIX: Set docPart to something other than 'Section'
-                    // to prevent Image Writer from adding 6 to the relationId.
-                    // In TemplateProcessor, we manage relation IDs directly without the
-                    // standard 6 system relationships (styles, numbering, settings, etc.)
-                    $childElement->setDocPart('Document', 1);
                     $this->addImageFromElement($childElement, $partFileName);
                 }
                 // Recursively process nested containers
@@ -734,8 +729,21 @@ class TemplateProcessor
         $imgIndex = $this->getNextRelationsIndex($partFileName);
         $rid = 'rId' . $imgIndex;
         
+        // CRITICAL: In TemplateProcessor, getNextRelationsIndex() returns the actual rId number (e.g., 7)
+        // But Image Writer will add 6 if isInSection() is true (which is the default).
+        // So we need to set relationId = actualRid - 6, so that (actualRid - 6) + 6 = actualRid
+        // This matches the normal PHPWord flow where Media assigns relationId=1,2,3... 
+        // and Writer adds 6 to get rId7,rId8,rId9...
+        $relationIdForElement = $imgIndex - 6;
+        if ($relationIdForElement < 1) {
+            // If the template doesn't have the 6 system relationships, don't subtract
+            $relationIdForElement = $imgIndex;
+            // And make sure Image Writer doesn't add 6
+            $image->setDocPart('Document', 1);
+        }
+        
         // Set relation ID on the image element (without the 'rId' prefix, just the number)
-        $image->setRelationId($imgIndex);
+        $image->setRelationId($relationIdForElement);
 
         // Handle different source types
         $sourceType = $image->getSourceType();
