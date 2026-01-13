@@ -283,16 +283,20 @@ class TemplateProcessor
         $elementName = substr(get_class($complexType), strrpos(get_class($complexType), '\\') + 1);
         $objectClass = 'PhpOffice\\PhpWord\\Writer\\Word2007\\Element\\' . $elementName;
 
-        $xmlWriter = new XMLWriter();
-        /** @var Writer\Word2007\Element\AbstractElement $elementWriter */
-        $elementWriter = new $objectClass($xmlWriter, $complexType, true);
-        $elementWriter->write();
-
         $where = $this->findContainingXmlBlockForMacro($search, 'w:r');
 
         if ($where === false) {
             return;
         }
+
+        // Process images in complex types BEFORE writing XML (to set relation IDs)
+        $partFileName = $this->getMainPartName();
+        $this->processComplexTypeImages($complexType, $partFileName);
+
+        $xmlWriter = new XMLWriter();
+        /** @var Writer\Word2007\Element\AbstractElement $elementWriter */
+        $elementWriter = new $objectClass($xmlWriter, $complexType, true);
+        $elementWriter->write();
 
         $block = $this->getSlice($where['start'], $where['end']);
         $textParts = $this->splitTextIntoTexts($block);
@@ -634,6 +638,122 @@ class TemplateProcessor
 
         // add image to relations
         $this->tempDocumentRelations[$partFileName] = str_replace('</Relationships>', $xmlImageRelation, $this->tempDocumentRelations[$partFileName]) . '</Relationships>';
+    }
+
+    /**
+     * Add image data (binary) to relations and ZIP package.
+     *
+     * @param string $partFileName
+     * @param string $rid
+     * @param string $imageData Binary image data
+     * @param string $imageMimeType
+     */
+    private function addImageDataToRelations($partFileName, $rid, $imageData, $imageMimeType): void
+    {
+        // define templates
+        $typeTpl = '<Override PartName="/word/media/{IMG}" ContentType="image/{EXT}"/>';
+        $relationTpl = '<Relationship Id="{RID}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/{IMG}"/>';
+        $newRelationsTpl = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' . "\n" . '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"></Relationships>';
+        $newRelationsTypeTpl = '<Override PartName="/{RELS}" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>';
+        $extTransform = [
+            'image/jpeg' => 'jpeg',
+            'image/png' => 'png',
+            'image/bmp' => 'bmp',
+            'image/gif' => 'gif',
+        ];
+
+        // transform extension
+        if (isset($extTransform[$imageMimeType])) {
+            $imgExt = $extTransform[$imageMimeType];
+        } else {
+            throw new Exception("Unsupported image type $imageMimeType");
+        }
+
+        // Generate unique image name
+        $imgName = 'image_' . $rid . '_' . pathinfo($partFileName, PATHINFO_FILENAME) . '.' . $imgExt;
+        
+        // Add image data directly to ZIP
+        $this->zipClass->addFromString('word/media/' . $imgName, $imageData);
+
+        // setup type for image
+        $xmlImageType = str_replace(['{IMG}', '{EXT}'], [$imgName, $imgExt], $typeTpl);
+        $this->tempDocumentContentTypes = str_replace('</Types>', $xmlImageType, $this->tempDocumentContentTypes) . '</Types>';
+
+        $xmlImageRelation = str_replace(['{RID}', '{IMG}'], [$rid, $imgName], $relationTpl);
+
+        if (!isset($this->tempDocumentRelations[$partFileName])) {
+            // create new relations file
+            $this->tempDocumentRelations[$partFileName] = $newRelationsTpl;
+            // and add it to content types
+            $xmlRelationsType = str_replace('{RELS}', $this->getRelationsName($partFileName), $newRelationsTypeTpl);
+            $this->tempDocumentContentTypes = str_replace('</Types>', $xmlRelationsType, $this->tempDocumentContentTypes) . '</Types>';
+        }
+
+        // add image to relations
+        $this->tempDocumentRelations[$partFileName] = str_replace('</Relationships>', $xmlImageRelation, $this->tempDocumentRelations[$partFileName]) . '</Relationships>';
+    }
+
+    /**
+     * Process images in complex types and add them to the document.
+     *
+     * @param Element\AbstractElement $element
+     * @param string $partFileName
+     */
+    private function processComplexTypeImages(Element\AbstractElement $element, $partFileName): void
+    {
+        // Check if element is a container (like TextRun)
+        if ($element instanceof Element\AbstractContainer) {
+            $elements = $element->getElements();
+            foreach ($elements as $childElement) {
+                if ($childElement instanceof Element\Image) {
+                    // CRITICAL FIX: Set docPart to something other than 'Section'
+                    // to prevent Image Writer from adding 6 to the relationId.
+                    // In TemplateProcessor, we manage relation IDs directly without the
+                    // standard 6 system relationships (styles, numbering, settings, etc.)
+                    $childElement->setDocPart('Document', 1);
+                    $this->addImageFromElement($childElement, $partFileName);
+                }
+                // Recursively process nested containers
+                $this->processComplexTypeImages($childElement, $partFileName);
+            }
+        }
+    }
+
+    /**
+     * Add an image element to the document.
+     *
+     * @param Element\Image $image
+     * @param string $partFileName
+     */
+    private function addImageFromElement(Element\Image $image, $partFileName): void
+    {
+        $imageType = $image->getImageType();
+        $imageMimeType = $imageType;
+
+        // Get the next relation ID
+        $imgIndex = $this->getNextRelationsIndex($partFileName);
+        $rid = 'rId' . $imgIndex;
+        
+        // Set relation ID on the image element (without the 'rId' prefix, just the number)
+        $image->setRelationId($imgIndex);
+
+        // Handle different source types
+        $sourceType = $image->getSourceType();
+        $imgPath = $image->getSource();
+        
+        // For memory images (GD, STRING, etc.), we need to get the binary data
+        // and add it directly to the ZIP, not as a file path
+        if ($image->isMemImage()) {
+            // Get image binary data
+            $imageData = $image->getImageString();
+            if ($imageData !== null) {
+                // Add image using binary data
+                $this->addImageDataToRelations($partFileName, $rid, $imageData, $imageMimeType);
+            }
+        } else {
+            // For local files and archives, use the file path
+            $this->addImageToRelations($partFileName, $rid, $imgPath, $imageMimeType);
+        }
     }
 
     /**
